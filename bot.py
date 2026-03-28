@@ -26,7 +26,7 @@ def execute_with_retry(func, *args, max_retries=10, **kwargs):
     for attempt in range(max_retries):
         conn = None
         try:
-            conn = sqlite3.connect("finance.db", timeout=120)
+            conn = sqlite3.connect("/app/data/finance.db", timeout=120)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=120000")
             conn.execute("PRAGMA synchronous=OFF")
