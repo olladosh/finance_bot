@@ -309,7 +309,7 @@ quiz_state = {}
 @guarded_handler
 async def start_quiz(message: types.Message):
     user_id = message.from_user.id
-    quiz_state[user_id] = {"step": 0, "score": 0}
+    quiz_state[user_id] = {"step": 0, "score": 0, "awaiting_answer": False}
     await ask_question(message, user_id)
 
 async def ask_question(message: types.Message, user_id: int):
@@ -327,8 +327,9 @@ async def ask_question(message: types.Message, user_id: int):
         del quiz_state[user_id]
         return
     q = QUIZ_QUESTIONS[step]
+    quiz_state[user_id]["awaiting_answer"] = True
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=opt, callback_data=f"ans_{opt}")] for opt in q["options"]
+        [InlineKeyboardButton(text=opt, callback_data=f"ans_{step}_{idx}")] for idx, opt in enumerate(q["options"])
     ])
     await message.answer(
         f"🎮 *Вопрос {step+1} из {total}* 🎮\n\n{q['question']}",
@@ -344,16 +345,34 @@ async def answer_question(callback: types.CallbackQuery):
         await callback.message.answer("Начни викторину кнопкой '🎮 Викторина'")
         await callback.answer()
         return
-    answer = callback.data.replace("ans_", "")
-    step = quiz_state[user_id]["step"]
+    state = quiz_state[user_id]
+    step = state["step"]
     q = QUIZ_QUESTIONS[step]
+    match = re.fullmatch(r"ans_(\d+)_(\d+)", callback.data or "")
+    if not match:
+        await callback.answer("Некорректный ответ", show_alert=True)
+        return
+    answer_step = int(match.group(1))
+    option_idx = int(match.group(2))
+    if not state.get("awaiting_answer"):
+        await callback.answer("Ответ уже принят", show_alert=False)
+        return
+    if answer_step != step or option_idx < 0 or option_idx >= len(q["options"]):
+        await callback.answer("Этот вопрос уже неактуален", show_alert=True)
+        return
+    state["awaiting_answer"] = False
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        logger.debug("Failed to remove quiz keyboard", exc_info=True)
+    answer = q["options"][option_idx]
     if answer == q["correct"]:
-        quiz_state[user_id]["score"] += 1
+        state["score"] += 1
         text = f"✅ *Правильно!* {q['explanation']}"
     else:
         text = f"❌ *Неправильно!* Правильный ответ: *{q['correct']}*\n\n{q['explanation']}"
     await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN)
-    quiz_state[user_id]["step"] += 1
+    state["step"] += 1
     await ask_question(callback.message, user_id)
     await callback.answer()
 
