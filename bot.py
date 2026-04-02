@@ -4,7 +4,8 @@ import sqlite3
 import random
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
+from functools import wraps
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -15,10 +16,15 @@ from apscheduler.triggers.cron import CronTrigger
 # ========== ТОКЕН БОТА (ВСТАВЛЕН ПРЯМО ЗДЕСЬ) ==========
 BOT_TOKEN = "8623084217:AAFq-LwPvNcsm0hVZ4KHwSA7dFJI8lVqo4A"
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+logger = logging.getLogger(__name__)
+DB_PATH = "/app/data/finance.db"
 
 # ========== БАЗА ДАННЫХ ==========
 
@@ -26,24 +32,85 @@ def execute_with_retry(func, *args, max_retries=10, **kwargs):
     for attempt in range(max_retries):
         conn = None
         try:
-            conn = sqlite3.connect("/app/data/finance.db", timeout=120)
+            conn = sqlite3.connect(DB_PATH, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=120000")
-            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA synchronous=NORMAL")
             cursor = conn.cursor()
             result = func(cursor, *args, **kwargs)
             conn.commit()
             return result
         except sqlite3.OperationalError as e:
-            if conn:
-                conn.close()
-            if "database is locked" in str(e) and attempt < max_retries - 1:
-                time.sleep(0.1 * (attempt + 1))
+            error_text = str(e).lower()
+            if ("database is locked" in error_text or "database table is locked" in error_text) and attempt < max_retries - 1:
+                wait_time = 0.15 * (attempt + 1)
+                logger.warning("SQLite locked, retry %s/%s in %.2fs", attempt + 1, max_retries, wait_time)
+                time.sleep(wait_time)
                 continue
+            logger.exception("SQLite operation failed")
+            raise
+        except Exception:
+            logger.exception("Unexpected database error")
             raise
         finally:
             if conn:
                 conn.close()
+
+
+async def run_db(func, *args, max_retries=10, **kwargs):
+    return await asyncio.to_thread(
+        execute_with_retry,
+        func,
+        *args,
+        max_retries=max_retries,
+        **kwargs,
+    )
+
+
+def upsert_subscriber(cursor, user_id, username, first_name):
+    cursor.execute(
+        """
+        INSERT INTO subscribers (user_id, username, first_name, subscribed_at, last_sent_date)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name
+        """,
+        (
+            user_id,
+            username,
+            first_name,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            None,
+        ),
+    )
+
+
+def guarded_handler(func):
+    @wraps(func)
+    async def wrapper(event, *args, **kwargs):
+        try:
+            return await func(event, *args, **kwargs)
+        except Exception:
+            logger.exception("Handler %s failed", func.__name__)
+            fallback_text = "Что-то пошло не так. Попробуйте еще раз через пару секунд."
+            if isinstance(event, types.CallbackQuery):
+                try:
+                    await event.answer("Произошла ошибка", show_alert=True)
+                except Exception:
+                    logger.debug("Failed to answer callback error", exc_info=True)
+                try:
+                    if event.message:
+                        await event.message.answer(fallback_text)
+                except Exception:
+                    logger.debug("Failed to send callback fallback message", exc_info=True)
+            elif isinstance(event, types.Message):
+                try:
+                    await event.answer(fallback_text, reply_markup=main_kb)
+                except Exception:
+                    logger.debug("Failed to send message fallback", exc_info=True)
+            return None
+    return wrapper
 
 def init_db():
     def _init(cursor):
@@ -85,7 +152,7 @@ def parse_amount(text: str) -> float:
         return None
     try:
         return float(numbers[0])
-    except:
+    except ValueError:
         return None
 
 # ========== ВОПРОСЫ ВИКТОРИНЫ (15 ШТУК) ==========
@@ -156,7 +223,7 @@ async def check_achievements(user_id, message):
             cursor.execute("INSERT INTO achievements VALUES (?, ?, ?)", (user_id, "saver", datetime.now().strftime("%Y-%m-%d")))
             new.append(ACHIEVEMENTS["saver"])
         return new
-    new = execute_with_retry(_check)
+    new = await run_db(_check)
     for ach in new:
         await message.answer(f"🏆 НОВОЕ ДОСТИЖЕНИЕ! 🏆\n\n{ach['emoji']} {ach['name']}\n{ach['desc']}", parse_mode=ParseMode.MARKDOWN)
 
@@ -164,21 +231,20 @@ async def check_achievements(user_id, message):
 
 def add_subscriber(user_id, username, first_name):
     def _add(cursor):
-        cursor.execute("INSERT OR IGNORE INTO subscribers VALUES (?, ?, ?, ?, ?)", 
-                      (user_id, username, first_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), None))
-    execute_with_retry(_add)
+        upsert_subscriber(cursor, user_id, username, first_name)
+    return run_db(_add)
 
 def get_all_subscribers():
     def _get(cursor):
         cursor.execute("SELECT user_id FROM subscribers")
         return cursor.fetchall()
-    return execute_with_retry(_get)
+    return run_db(_get)
 
 def update_last_sent(user_id):
     def _update(cursor):
         cursor.execute("UPDATE subscribers SET last_sent_date = ? WHERE user_id = ?", 
                       (datetime.now().strftime("%Y-%m-%d"), user_id))
-    execute_with_retry(_update)
+    return run_db(_update)
 
 def get_date_header():
     now = datetime.now()
@@ -187,17 +253,18 @@ def get_date_header():
     return now.day, months[now.month-1], now.year, days[now.weekday()], now.strftime("%H:%M")
 
 async def send_daily_tip():
-    subs = get_all_subscribers()
+    subs = await get_all_subscribers()
     if not subs:
         return
     tip = random.choice(DAILY_TIPS)
-    day, month, year, weekday, time = get_date_header()
+    day, month, year, weekday, current_time = get_date_header()
+    time = current_time
     for (user_id,) in subs:
         try:
             await bot.send_message(user_id, f"🌅 ДОБРОЕ УТРО! 🌅\n\n📅 {day} {month} {year}, {weekday}\n⏰ {time}\n\n{tip}\n\n👉 Нажми /start", parse_mode=ParseMode.MARKDOWN)
-            update_last_sent(user_id)
-        except:
-            pass
+            await update_last_sent(user_id)
+        except Exception:
+            logger.warning("Failed to send daily tip to user %s", user_id, exc_info=True)
 
 # ========== КЛАВИАТУРА ==========
 
@@ -239,6 +306,7 @@ REASONS_TEXT = """💡 11 ВЕСКИХ ПРИЧИН ВЕСТИ УЧЕТ ТРАТ
 quiz_state = {}
 
 @dp.message(lambda msg: msg.text == "🎮 Викторина")
+@guarded_handler
 async def start_quiz(message: types.Message):
     user_id = message.from_user.id
     quiz_state[user_id] = {"step": 0, "score": 0}
@@ -269,6 +337,7 @@ async def ask_question(message: types.Message, user_id: int):
     )
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("ans_"))
+@guarded_handler
 async def answer_question(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     if user_id not in quiz_state:
@@ -291,33 +360,38 @@ async def answer_question(callback: types.CallbackQuery):
 # ========== ОСТАЛЬНЫЕ КОМАНДЫ ==========
 
 @dp.message(Command("start"))
+@guarded_handler
 async def start_cmd(message: types.Message):
     await message.answer(f"💸 Добро пожаловать в финансовый трекер!\n\n👇 Нажми кнопку ниже:", reply_markup=main_kb, parse_mode=ParseMode.MARKDOWN)
 
 @dp.message(lambda msg: msg.text == "💡 Совет дня")
+@guarded_handler
 async def tip_cmd(message: types.Message):
     tip = random.choice(DAILY_TIPS)
     day, month, year, weekday, time = get_date_header()
     await message.answer(f"💡 СОВЕТ ДНЯ 💡\n\n📅 {day} {month} {year}, {weekday}\n⏰ {time}\n\n{tip}", parse_mode=ParseMode.MARKDOWN)
 
 @dp.message(lambda msg: msg.text == "🔔 Подписка на советы")
+@guarded_handler
 async def sub_cmd(message: types.Message):
     user_id = message.from_user.id
     def _check(cursor):
         cursor.execute("SELECT user_id FROM subscribers WHERE user_id=?", (user_id,))
         return cursor.fetchone()
-    exists = execute_with_retry(_check)
+    exists = await run_db(_check)
     if exists:
         await message.answer("🔔 Вы уже подписаны! Советы приходят каждый день в 9:00", parse_mode=ParseMode.MARKDOWN)
     else:
-        add_subscriber(user_id, message.from_user.username or "", message.from_user.first_name or "")
+        await add_subscriber(user_id, message.from_user.username or "", message.from_user.first_name or "")
         await message.answer("✅ Вы подписались на ежедневные советы! Каждое утро в 9:00 будет приходить полезный совет.", parse_mode=ParseMode.MARKDOWN)
 
 @dp.message(lambda msg: msg.text == "🎯 11 причин")
+@guarded_handler
 async def reasons_cmd(message: types.Message):
     await message.answer(REASONS_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 @dp.message(lambda msg: msg.text == "❓ Помощь")
+@guarded_handler
 async def help_cmd(message: types.Message):
     await message.answer("📖 Как пользоваться:\n\n➕ Доход — выбери категорию и введи сумму\n➖ Расход — выбери категорию и введи сумму\n📊 Статистика — общая статистика\n📅 Отчет за месяц — детальный отчет\n💰 Бюджет — установи лимит\n💡 Совет дня — случайный совет\n🎮 Викторина — 15 вопросов\n🔔 Подписка — ежедневные советы\n🎯 11 причин — мотивация\n\n💡 Вводить сумму можно в любом формате:\n50000, 50.000, 50 000, 50000р, 50000 руб, 50000₽", parse_mode=ParseMode.MARKDOWN)
 
@@ -328,16 +402,19 @@ income_cats = ["💰 Зарплата", "📈 Инвестиции", "🎁 По�
 expense_cats = ["🍔 Еда", "🏠 Жилье", "🚗 Транспорт", "📱 Связь", "🛍️ Шопинг", "🎬 Развлечения", "💊 Здоровье", "📚 Образование", "🐶 Другое"]
 
 @dp.message(lambda msg: msg.text == "➕ Добавить доход")
+@guarded_handler
 async def inc_cmd(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=cat, callback_data=f"inc_{cat}")] for cat in income_cats])
     await message.answer("💰 Выбери категорию дохода:", reply_markup=kb)
 
 @dp.message(lambda msg: msg.text == "➖ Добавить расход")
+@guarded_handler
 async def exp_cmd(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=cat, callback_data=f"exp_{cat}")] for cat in expense_cats])
     await message.answer("🛒 Выбери категорию расхода:", reply_markup=kb)
 
-@dp.callback_query(lambda c: c.data.startswith("inc_") or c.data.startswith("exp_"))
+@dp.callback_query(lambda c: c.data and (c.data.startswith("inc_") or c.data.startswith("exp_")))
+@guarded_handler
 async def cat_selected(callback: types.CallbackQuery):
     if callback.data.startswith("inc_"):
         user_state[callback.from_user.id] = {"type": "income", "category": callback.data.replace("inc_", "")}
@@ -348,6 +425,7 @@ async def cat_selected(callback: types.CallbackQuery):
     await callback.answer()
 
 @dp.message(lambda msg: msg.from_user.id in user_state)
+@guarded_handler
 async def amount_cmd(message: types.Message):
     uid = message.from_user.id
     data = user_state[uid]
@@ -363,10 +441,10 @@ async def amount_cmd(message: types.Message):
                       (uid, data["type"], amount, data["category"], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         cursor.execute("SELECT user_id FROM subscribers WHERE user_id=?", (uid,))
         if not cursor.fetchone():
-            add_subscriber(uid, message.from_user.username or "", message.from_user.first_name or "")
+            upsert_subscriber(cursor, uid, message.from_user.username or "", message.from_user.first_name or "")
             return True
         return False
-    should_notify = execute_with_retry(_save)
+    should_notify = await run_db(_save)
     if should_notify:
         await message.answer("🔔 Бонус! Подписал вас на ежедневные советы в 9:00")
     await check_achievements(uid, message)
@@ -376,6 +454,7 @@ async def amount_cmd(message: types.Message):
 # ========== СТАТИСТИКА ==========
 
 @dp.message(lambda msg: msg.text == "📊 Статистика")
+@guarded_handler
 async def stats_cmd(message: types.Message):
     uid = message.from_user.id
     def _stats(cursor):
@@ -389,7 +468,7 @@ async def stats_cmd(message: types.Message):
         streak_row = cursor.fetchone()
         streak = streak_row[0] if streak_row else 0
         return inc, exp, top, streak
-    inc, exp, top, streak = execute_with_retry(_stats)
+    inc, exp, top, streak = await run_db(_stats)
     text = f"📊 *ФИНАНСОВАЯ СТАТИСТИКА*\n\n💰 Доходы: {inc:,.0f} ₽\n🛒 Расходы: {exp:,.0f} ₽\n💎 Баланс: {inc-exp:,.0f} ₽\n🔥 Стрик: {streak} дней\n\n"
     if top:
         text += "🔥 *Топ расходов:*\n"
@@ -399,7 +478,8 @@ async def stats_cmd(message: types.Message):
 
 # ========== ОТЧЕТ ЗА МЕСЯЦ ==========
 
-@dp.message(lambda msg: msg.text == "📅 Отчет за месяц")
+@dp.message(lambda msg: msg.text == "📅 Отчет за месяц :)")
+@guarded_handler
 async def report_cmd(message: types.Message):
     uid = message.from_user.id
     first = datetime.now().replace(day=1).strftime("%Y-%m-%d")
@@ -411,7 +491,7 @@ async def report_cmd(message: types.Message):
         cursor.execute("SELECT category, SUM(amount) FROM transactions WHERE user_id=? AND type='expense' AND date >= ? GROUP BY category", (uid, first))
         cats = cursor.fetchall()
         return inc, exp, cats
-    inc, exp, cats = execute_with_retry(_report)
+    inc, exp, cats = await run_db(_report)
     months = ["Январь","Февраль","Март","Апрель","Май","Июнь","Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"]
     text = f"📅 *ОТЧЕТ ЗА {months[datetime.now().month-1].upper()}* 📅\n\n💰 Доходы: {inc:,.0f} ₽\n🛒 Расходы: {exp:,.0f} ₽\n💎 Сбережено: {inc-exp:,.0f} ₽\n\n"
     if cats:
@@ -425,6 +505,7 @@ async def report_cmd(message: types.Message):
 budget_state = {}
 
 @dp.message(lambda msg: msg.text == "💰 Бюджет")
+@guarded_handler
 async def budget_cmd(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Установить бюджет", callback_data="set_b")],
@@ -434,12 +515,14 @@ async def budget_cmd(message: types.Message):
     await message.answer("💰 *Управление бюджетом*", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 @dp.callback_query(lambda c: c.data == "set_b")
+@guarded_handler
 async def set_b(callback: types.CallbackQuery):
     budget_state[callback.from_user.id] = True
     await callback.message.answer("💰 Введи месячный бюджет (в рублях):\n\nПримеры: 50000, 50.000, 50 000")
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "check_b")
+@guarded_handler
 async def check_b(callback: types.CallbackQuery):
     uid = callback.from_user.id
     def _check(cursor):
@@ -450,7 +533,7 @@ async def check_b(callback: types.CallbackQuery):
         cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE user_id=? AND type='expense' AND date >= ?", (uid, first))
         spent = cursor.fetchone()[0] or 0
         return b, spent
-    b, spent = execute_with_retry(_check)
+    b, spent = await run_db(_check)
     if b > 0:
         rem = b - spent
         await callback.message.answer(
@@ -465,12 +548,13 @@ async def check_b(callback: types.CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "my_ach")
+@guarded_handler
 async def my_ach(callback: types.CallbackQuery):
     uid = callback.from_user.id
     def _get(cursor):
         cursor.execute("SELECT achievement FROM achievements WHERE user_id=?", (uid,))
         return {row[0] for row in cursor.fetchall()}
-    earned = execute_with_retry(_get)
+    earned = await run_db(_get)
     text = "🏆 *МОИ ДОСТИЖЕНИЯ* 🏆\n\n"
     for key, ach in ACHIEVEMENTS.items():
         text += f"{'✅' if key in earned else '⬜'} {ach['emoji']} {ach['name']} — {ach['desc']}\n"
@@ -478,6 +562,7 @@ async def my_ach(callback: types.CallbackQuery):
     await callback.answer()
 
 @dp.message(lambda msg: msg.from_user.id in budget_state)
+@guarded_handler
 async def budget_amount(message: types.Message):
     amount = parse_amount(message.text)
     if amount is None:
@@ -486,7 +571,7 @@ async def budget_amount(message: types.Message):
     uid = message.from_user.id
     def _save(cursor):
         cursor.execute("INSERT OR REPLACE INTO budgets VALUES (?, ?)", (uid, amount))
-    execute_with_retry(_save)
+    await run_db(_save)
     await message.answer(f"💰 Бюджет установлен: {amount:,.0f} ₽/мес", parse_mode=ParseMode.MARKDOWN)
     del budget_state[uid]
 
